@@ -28,6 +28,7 @@ st.set_page_config(
 )
 
 DEFAULT_FILE = "Sales Report_24_04_2024.xlsx"
+DEFAULT_ORDERS_FILE = "Secured orders.xlsx"
 
 EXPECTED_COLUMNS = [
     "Billing Type", "Billing Document", "Billing Date", "Customer",
@@ -35,6 +36,15 @@ EXPECTED_COLUMNS = [
     "Net Sales Volume", "Division", "Sales Empl. Name",
     "Manufacturer Name", "Product Group", "Tax Amount",
     "Cost (Actual)", "Profit Margin", "Profit Margin Ratio", "City Name",
+]
+
+ORDERS_EXPECTED_COLUMNS = [
+    "Sales Order", "Document Date", "Name of Customer", "Product Id",
+    "Product Desc", "Order Quantity", "Net Price", "Net Value",
+    "Delivered Quantity", "Net Value (Delivered)", "Pending Quantity",
+    "Net Value (Pending)", "Division", "Sales Empl. Name",
+    "Manufacturer Name", "City Name", "Product Group",
+    "Requested Delivery Date",
 ]
 
 # -----------------------------------------------------------------------------
@@ -192,6 +202,68 @@ def load_data(source, name: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner="Reading secured orders...")
+def load_orders_data(source, name: str) -> pd.DataFrame:
+    """Load secured-orders CSV/Excel and normalize it.
+
+    Renames `Name of Customer` -> `Customer` so it lines up with the
+    sales report. Adds the same `Sub-team` column for consistency.
+    """
+    name_lower = name.lower()
+    if name_lower.endswith(".csv"):
+        try:
+            df = pd.read_csv(source)
+        except UnicodeDecodeError:
+            if hasattr(source, "seek"):
+                source.seek(0)
+            df = pd.read_csv(source, encoding="latin-1")
+    else:
+        df = pd.read_excel(source)
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Align customer column with the sales report
+    if "Name of Customer" in df.columns and "Customer" not in df.columns:
+        df = df.rename(columns={"Name of Customer": "Customer"})
+
+    for c in ["Document Date", "Requested Delivery Date"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    numeric_cols = [
+        "Order Quantity", "Net Price", "Net Value",
+        "Delivered Quantity", "Net Value (Delivered)",
+        "Pending Quantity", "Net Value (Pending)",
+    ]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    text_cols = ["Division", "Sales Empl. Name", "Customer", "Product Group",
+                 "Manufacturer Name", "Product Desc", "Product Id",
+                 "City Name", "Sales Order"]
+    for c in text_cols:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    if "City Name" in df.columns:
+        df["City Name"] = df["City Name"].replace(
+            {"nan": "Unknown", "": "Unknown", "None": "Unknown"}
+        )
+
+    if "Division" in df.columns and "Sales Empl. Name" in df.columns:
+        df["Sub-team"] = [
+            assign_sub_team(d, e)
+            for d, e in zip(df["Division"], df["Sales Empl. Name"])
+        ]
+
+    # Open / closed status flags
+    if "Net Value (Pending)" in df.columns:
+        df["Is Open"] = df["Net Value (Pending)"].fillna(0) > 0
+
+    return df
+
+
 # =============================================================================
 # Formatting helpers
 # =============================================================================
@@ -266,6 +338,40 @@ def kpis(d: pd.DataFrame) -> dict:
     )
 
 
+def order_kpis(d: pd.DataFrame) -> dict:
+    """Compute headline metrics for the secured-orders dataframe."""
+    if d is None or d.empty:
+        return dict(total_value=0.0, delivered_value=0.0, pending_value=0.0,
+                    pending_qty=0.0, n_orders=0, n_open_orders=0,
+                    n_lines=0, n_open_lines=0, customers=0, employees=0,
+                    delivered_pct=0.0, pending_pct=0.0)
+    total = float(d["Net Value"].sum()) if "Net Value" in d else 0.0
+    delivered = float(d["Net Value (Delivered)"].sum()) \
+        if "Net Value (Delivered)" in d else 0.0
+    pending = float(d["Net Value (Pending)"].sum()) \
+        if "Net Value (Pending)" in d else max(total - delivered, 0.0)
+    pending_qty = float(d["Pending Quantity"].sum()) \
+        if "Pending Quantity" in d else 0.0
+    open_mask = d["Net Value (Pending)"] > 0 if "Net Value (Pending)" in d \
+        else pd.Series([False] * len(d), index=d.index)
+    return dict(
+        total_value=total,
+        delivered_value=delivered,
+        pending_value=pending,
+        pending_qty=pending_qty,
+        n_orders=int(d["Sales Order"].nunique()) if "Sales Order" in d else 0,
+        n_open_orders=int(d.loc[open_mask, "Sales Order"].nunique())
+        if "Sales Order" in d else 0,
+        n_lines=len(d),
+        n_open_lines=int(open_mask.sum()),
+        customers=int(d["Customer"].nunique()) if "Customer" in d else 0,
+        employees=int(d["Sales Empl. Name"].nunique())
+        if "Sales Empl. Name" in d else 0,
+        delivered_pct=(delivered / total * 100) if total else 0.0,
+        pending_pct=(pending / total * 100) if total else 0.0,
+    )
+
+
 # =============================================================================
 # Header
 # =============================================================================
@@ -322,6 +428,53 @@ st.sidebar.markdown(
     f"<span class='muted'>{len(df_full):,} rows in file</span>",
     unsafe_allow_html=True,
 )
+
+# --- Secured orders (optional second file) ----------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Secured orders (optional)")
+
+uploaded_orders = st.sidebar.file_uploader(
+    "Upload secured orders (Excel/CSV)",
+    type=["xlsx", "xls", "csv"],
+    key="orders_uploader",
+    help=(
+        "An open-orders / secured-orders export with columns like "
+        "Sales Order, Document Date, Net Value, Net Value (Pending), "
+        "Division, Sales Empl. Name."
+    ),
+)
+
+df_orders_full: pd.DataFrame | None = None
+orders_source: str | None = None
+
+if uploaded_orders is not None:
+    try:
+        df_orders_full = load_orders_data(uploaded_orders, uploaded_orders.name)
+        orders_source = uploaded_orders.name
+    except Exception as e:
+        st.sidebar.error(f"Could not read orders file:\n{e}")
+elif Path(DEFAULT_ORDERS_FILE).exists():
+    try:
+        df_orders_full = load_orders_data(DEFAULT_ORDERS_FILE, DEFAULT_ORDERS_FILE)
+        orders_source = DEFAULT_ORDERS_FILE
+    except Exception as e:
+        st.sidebar.error(f"Could not read default orders file:\n{e}")
+
+if df_orders_full is not None and not df_orders_full.empty:
+    st.sidebar.markdown(
+        f"<span class='muted'>Orders: <b>{orders_source}</b></span>",
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown(
+        f"<span class='muted'>{len(df_orders_full):,} order lines</span>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.sidebar.markdown(
+        "<span class='muted'>No secured-orders file loaded - upload "
+        "one to unlock the Pipeline tab.</span>",
+        unsafe_allow_html=True,
+    )
 
 currency = st.sidebar.text_input("Currency label", value="AED", max_chars=6).strip() or "AED"
 
@@ -429,11 +582,36 @@ df = apply_in(df, "Customer", f_cust)
 if not include_credits and "Billing Type" in df.columns:
     df = df[df["Billing Type"].str.contains("Invoice", case=False, na=False)]
 
+# --- Apply the same filters to the orders dataframe ------------------------
+# Date filter for orders is applied to "Document Date" (when the order
+# was booked). Defaults to the same period the user picked.
+df_orders = None
+if df_orders_full is not None and not df_orders_full.empty:
+    df_orders = df_orders_full.copy()
+    if "Document Date" in df_orders.columns:
+        m_o = (
+            (df_orders["Document Date"].dt.date >= start_d)
+            & (df_orders["Document Date"].dt.date <= end_d)
+        )
+        df_orders = df_orders[m_o | df_orders["Document Date"].isna()]
+    df_orders = apply_in(df_orders, "Division", f_div)
+    df_orders = apply_in(df_orders, "Sub-team", f_subteam)
+    df_orders = apply_in(df_orders, "Sales Empl. Name", f_emp)
+    df_orders = apply_in(df_orders, "Product Group", f_pg)
+    df_orders = apply_in(df_orders, "Manufacturer Name", f_man)
+    df_orders = apply_in(df_orders, "City Name", f_city)
+    df_orders = apply_in(df_orders, "Customer", f_cust)
+
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    f"<span class='muted'>Filtered rows: <b>{len(df):,}</b></span>",
+    f"<span class='muted'>Filtered sales rows: <b>{len(df):,}</b></span>",
     unsafe_allow_html=True,
 )
+if df_orders is not None:
+    st.sidebar.markdown(
+        f"<span class='muted'>Filtered order lines: <b>{len(df_orders):,}</b></span>",
+        unsafe_allow_html=True,
+    )
 
 
 # =============================================================================
@@ -481,26 +659,48 @@ c4.metric("Sales employees", fmt_int(m["employees"]))
 avg_doc = (m["sales"] / m["docs"]) if m["docs"] else 0
 c5.metric("Avg invoice value", fmt_money(avg_doc, currency))
 
+# --- Pipeline KPI row (only when an orders file is loaded) -----------------
+mo = order_kpis(df_orders) if df_orders is not None else None
+if mo and mo["n_lines"] > 0:
+    st.markdown(
+        "<div style='margin-top: 0.6rem; color: var(--text-color, inherit); "
+        "opacity: 0.65; font-size: 0.78rem; letter-spacing: 0.06em; "
+        "text-transform: uppercase;'>Secured orders pipeline</div>",
+        unsafe_allow_html=True,
+    )
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("Pipeline value (pending)",
+              fmt_money(mo["pending_value"], currency))
+    p2.metric("Total order value",
+              fmt_money(mo["total_value"], currency),
+              delta=f"{mo['delivered_pct']:.1f}% delivered",
+              delta_color="off")
+    p3.metric("Open orders", fmt_int(mo["n_open_orders"]),
+              delta=f"of {mo['n_orders']:,} total",
+              delta_color="off")
+    p4.metric("Combined expected (billed + pending)",
+              fmt_money(m["sales"] + mo["pending_value"], currency))
+    avg_pending = (mo["pending_value"] / mo["n_open_orders"]) \
+        if mo["n_open_orders"] else 0
+    p5.metric("Avg open-order value", fmt_money(avg_pending, currency))
+
 st.markdown("<hr style='margin: 1.2rem 0; border-color: #e6e8ed;'>", unsafe_allow_html=True)
 
 
 # =============================================================================
 # Tabs
 # =============================================================================
-tabs = st.tabs([
-    "Overview",
-    "Departments",
-    "Employees",
-    "Customers",
-    "Products",
-    "Geography",
-    "Time trend",
-    "Raw data",
-])
+_tab_labels = ["Overview"]
+if df_orders is not None and not df_orders.empty:
+    _tab_labels.append("Pipeline")
+_tab_labels += ["Departments", "Employees", "Customers", "Products",
+                "Geography", "Time trend", "Raw data"]
+tabs = st.tabs(_tab_labels)
+_tab_idx = {label: i for i, label in enumerate(_tab_labels)}
 
 
 # ---------- Tab: Overview --------------------------------------------------
-with tabs[0]:
+with tabs[_tab_idx["Overview"]]:
     st.subheader("At-a-glance summary")
 
     if df.empty:
@@ -599,8 +799,603 @@ with tabs[0]:
         h5.metric("Avg sales per customer", fmt_money(avg_sales_per_cust, currency))
 
 
+# ---------- Tab: Pipeline (secured orders) ---------------------------------
+if "Pipeline" in _tab_idx:
+    with tabs[_tab_idx["Pipeline"]]:
+        st.subheader("Secured orders pipeline")
+        st.caption(
+            "All numbers below are based on the secured-orders file. The "
+            "date range filters by **Document Date** (when the order was "
+            "booked). Pending = order value still to deliver."
+        )
+
+        if df_orders is None or df_orders.empty:
+            st.info("No secured-order rows match the current filters.")
+        else:
+            # Pipeline-only view toggle
+            only_open = st.checkbox(
+                "Show only open / pending order lines",
+                value=True,
+                help="When ticked, fully-delivered lines are hidden so you "
+                "see exactly what's still to come in.",
+            )
+            d_o = df_orders[df_orders["Net Value (Pending)"] > 0] \
+                if only_open and "Net Value (Pending)" in df_orders.columns \
+                else df_orders
+
+            if d_o.empty:
+                st.info("No order lines after applying the open-only filter.")
+            else:
+                pipe = order_kpis(d_o)
+
+                # Top KPIs (pipeline-specific)
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("Pipeline value (pending)",
+                          fmt_money(pipe["pending_value"], currency))
+                k2.metric("Total order value",
+                          fmt_money(pipe["total_value"], currency))
+                k3.metric("Delivered so far",
+                          fmt_money(pipe["delivered_value"], currency),
+                          delta=f"{pipe['delivered_pct']:.1f}% of orders",
+                          delta_color="off")
+                k4.metric("Open orders", fmt_int(pipe["n_open_orders"]))
+                k5.metric("Pending units", fmt_int(pipe["pending_qty"]))
+
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("Customers w/ pipeline",
+                          fmt_int(pipe["customers"]))
+                k2.metric("Employees w/ pipeline",
+                          fmt_int(pipe["employees"]))
+                avg_open = (pipe["pending_value"] / pipe["n_open_orders"]) \
+                    if pipe["n_open_orders"] else 0
+                k3.metric("Avg pending / order",
+                          fmt_money(avg_open, currency))
+                avg_line = (pipe["pending_value"] / pipe["n_open_lines"]) \
+                    if pipe["n_open_lines"] else 0
+                k4.metric("Avg pending / line",
+                          fmt_money(avg_line, currency))
+                # Conversion rate: delivered / total
+                k5.metric("Order conversion %",
+                          f"{pipe['delivered_pct']:.1f}%")
+
+                st.markdown("---")
+
+                # ---- Pipeline sub-tabs --------------------------------------
+                pipe_tabs = st.tabs([
+                    "By department",
+                    "By sub-team",
+                    "By employee",
+                    "Combined (billed + pipeline)",
+                    "By customer",
+                    "By product / manufacturer",
+                    "Aging",
+                    "Time trend",
+                    "Raw orders",
+                ])
+
+                # ---- 1) By department ---------------------------------------
+                with pipe_tabs[0]:
+                    if "Division" in d_o.columns:
+                        t = (d_o.groupby("Division")
+                             .agg(**{
+                                 "Total order value": ("Net Value", "sum"),
+                                 "Delivered": ("Net Value (Delivered)", "sum"),
+                                 "Pending": ("Net Value (Pending)", "sum"),
+                                 "Pending units": ("Pending Quantity", "sum"),
+                                 "Open orders": ("Sales Order", "nunique"),
+                                 "Customers": ("Customer", "nunique"),
+                                 "Employees": ("Sales Empl. Name", "nunique"),
+                             }).reset_index())
+                        t["Delivered %"] = np.where(
+                            t["Total order value"] != 0,
+                            t["Delivered"] / t["Total order value"] * 100, 0)
+                        t["% of pipeline"] = np.where(
+                            pipe["pending_value"],
+                            t["Pending"] / pipe["pending_value"] * 100, 0)
+                        t = t.sort_values("Pending", ascending=False)
+
+                        total = pd.DataFrame([{
+                            "Division": "-- TOTAL --",
+                            "Total order value": t["Total order value"].sum(),
+                            "Delivered": t["Delivered"].sum(),
+                            "Pending": t["Pending"].sum(),
+                            "Pending units": t["Pending units"].sum(),
+                            "Open orders": int(d_o["Sales Order"].nunique()),
+                            "Customers": int(d_o["Customer"].nunique()),
+                            "Employees": int(d_o["Sales Empl. Name"].nunique()),
+                            "Delivered %": (
+                                t["Delivered"].sum() / t["Total order value"].sum() * 100
+                            ) if t["Total order value"].sum() else 0,
+                            "% of pipeline": 100.0,
+                        }])
+                        out = pd.concat([t, total], ignore_index=True)
+
+                        st.dataframe(
+                            out, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                out, currency,
+                                money=["Total order value", "Delivered", "Pending"],
+                                pct=["Delivered %", "% of pipeline"],
+                                ints=["Pending units", "Open orders",
+                                      "Customers", "Employees"],
+                            ),
+                        )
+
+                # ---- 2) By sub-team -----------------------------------------
+                with pipe_tabs[1]:
+                    if "Sub-team" not in d_o.columns:
+                        st.info("No sub-team data.")
+                    else:
+                        st.markdown(
+                            "Sub-team rollup. Divisions without a configured "
+                            "mapping show as '-'."
+                        )
+                        t = (d_o.groupby(["Division", "Sub-team"])
+                             .agg(**{
+                                 "Total order value": ("Net Value", "sum"),
+                                 "Delivered": ("Net Value (Delivered)", "sum"),
+                                 "Pending": ("Net Value (Pending)", "sum"),
+                                 "Open orders": ("Sales Order", "nunique"),
+                                 "Customers": ("Customer", "nunique"),
+                                 "Employees": ("Sales Empl. Name", "nunique"),
+                             }).reset_index())
+                        t["Delivered %"] = np.where(
+                            t["Total order value"] != 0,
+                            t["Delivered"] / t["Total order value"] * 100, 0)
+                        t = t.sort_values(
+                            ["Division", "Pending"],
+                            ascending=[True, False],
+                        )
+                        st.dataframe(
+                            t, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                t, currency,
+                                money=["Total order value", "Delivered", "Pending"],
+                                pct=["Delivered %"],
+                                ints=["Open orders", "Customers", "Employees"],
+                            ),
+                        )
+
+                # ---- 3) By employee -----------------------------------------
+                with pipe_tabs[2]:
+                    sort_pipe = st.selectbox(
+                        "Sort employees by",
+                        options=["Pending", "Total order value",
+                                 "Delivered", "Open orders"],
+                        index=0, key="pipe_emp_sort",
+                    )
+                    group_cols_e = ["Sales Empl. Name"]
+                    if "Sub-team" in d_o.columns:
+                        group_cols_e = ["Sales Empl. Name", "Sub-team"]
+                    t = (d_o.groupby(group_cols_e, dropna=False)
+                         .agg(**{
+                             "Total order value": ("Net Value", "sum"),
+                             "Delivered": ("Net Value (Delivered)", "sum"),
+                             "Pending": ("Net Value (Pending)", "sum"),
+                             "Open orders": ("Sales Order", "nunique"),
+                             "Customers": ("Customer", "nunique"),
+                             "Departments": ("Division", "nunique"),
+                         }).reset_index())
+                    t["Delivered %"] = np.where(
+                        t["Total order value"] != 0,
+                        t["Delivered"] / t["Total order value"] * 100, 0)
+                    t["% of pipeline"] = np.where(
+                        pipe["pending_value"],
+                        t["Pending"] / pipe["pending_value"] * 100, 0)
+                    t = t.sort_values(sort_pipe, ascending=False)
+                    t = t.rename(columns={"Sales Empl. Name": "Employee"})
+                    t.insert(0, "Rank", range(1, len(t) + 1))
+                    st.dataframe(
+                        t, hide_index=True, use_container_width=True,
+                        column_config=build_col_config(
+                            t, currency,
+                            money=["Total order value", "Delivered", "Pending"],
+                            pct=["Delivered %", "% of pipeline"],
+                            ints=["Rank", "Open orders", "Customers", "Departments"],
+                        ),
+                    )
+
+                # ---- 4) Combined (billed + pipeline) ------------------------
+                with pipe_tabs[3]:
+                    st.markdown(
+                        "**Billed sales** come from the sales report (already "
+                        "invoiced). **Pending** comes from the secured-orders "
+                        "file (open / not yet completed). Both are filtered "
+                        "by the same period and division/employee filters."
+                    )
+                    if "Sales Empl. Name" in df.columns and "Sales Empl. Name" in d_o.columns:
+                        billed = (df.groupby("Sales Empl. Name")
+                                  .agg(**{"Billed sales":
+                                          ("Net Sales Volume", "sum")})
+                                  .reset_index())
+                        pending = (d_o.groupby("Sales Empl. Name")
+                                   .agg(**{
+                                       "Pending":
+                                           ("Net Value (Pending)", "sum"),
+                                       "Open orders":
+                                           ("Sales Order", "nunique"),
+                                   }).reset_index())
+                        merged = billed.merge(
+                            pending, on="Sales Empl. Name", how="outer"
+                        ).fillna(0)
+                        merged["Combined"] = (
+                            merged["Billed sales"] + merged["Pending"]
+                        )
+                        merged["Pipeline mix %"] = np.where(
+                            merged["Combined"] != 0,
+                            merged["Pending"] / merged["Combined"] * 100, 0,
+                        )
+                        # Add sub-team
+                        if "Sub-team" in df_full.columns:
+                            emp_st = (
+                                pd.concat([
+                                    df_full[["Sales Empl. Name", "Sub-team"]],
+                                    df_orders_full[["Sales Empl. Name", "Sub-team"]]
+                                    if df_orders_full is not None
+                                    else df[["Sales Empl. Name", "Sub-team"]],
+                                ], ignore_index=True)
+                                .drop_duplicates(subset=["Sales Empl. Name"])
+                            )
+                            merged = merged.merge(
+                                emp_st, on="Sales Empl. Name", how="left",
+                            )
+                        merged = merged.sort_values("Combined", ascending=False)
+                        merged = merged.rename(
+                            columns={"Sales Empl. Name": "Employee"}
+                        )
+                        merged.insert(0, "Rank", range(1, len(merged) + 1))
+
+                        display_cols = ["Rank", "Employee"]
+                        if "Sub-team" in merged.columns:
+                            display_cols.append("Sub-team")
+                        display_cols += ["Billed sales", "Pending",
+                                         "Combined", "Pipeline mix %",
+                                         "Open orders"]
+                        merged = merged[[c for c in display_cols
+                                         if c in merged.columns]]
+                        st.dataframe(
+                            merged, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                merged, currency,
+                                money=["Billed sales", "Pending", "Combined"],
+                                pct=["Pipeline mix %"],
+                                ints=["Rank", "Open orders"],
+                            ),
+                        )
+
+                        # Combined by department too
+                        st.markdown("**Combined by department**")
+                        b2 = (df.groupby("Division")
+                              .agg(**{"Billed sales":
+                                      ("Net Sales Volume", "sum")})
+                              .reset_index())
+                        p2 = (d_o.groupby("Division")
+                              .agg(**{
+                                  "Pending":
+                                      ("Net Value (Pending)", "sum"),
+                                  "Open orders":
+                                      ("Sales Order", "nunique"),
+                              }).reset_index())
+                        m2 = b2.merge(p2, on="Division", how="outer").fillna(0)
+                        m2["Combined"] = m2["Billed sales"] + m2["Pending"]
+                        m2["Pipeline mix %"] = np.where(
+                            m2["Combined"] != 0,
+                            m2["Pending"] / m2["Combined"] * 100, 0,
+                        )
+                        m2 = m2.sort_values("Combined", ascending=False)
+
+                        total = pd.DataFrame([{
+                            "Division": "-- TOTAL --",
+                            "Billed sales": m2["Billed sales"].sum(),
+                            "Pending": m2["Pending"].sum(),
+                            "Open orders": m2["Open orders"].sum(),
+                            "Combined": m2["Combined"].sum(),
+                            "Pipeline mix %": (
+                                m2["Pending"].sum() / m2["Combined"].sum() * 100
+                            ) if m2["Combined"].sum() else 0,
+                        }])
+                        m2_out = pd.concat([m2, total], ignore_index=True)
+                        st.dataframe(
+                            m2_out, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                m2_out, currency,
+                                money=["Billed sales", "Pending", "Combined"],
+                                pct=["Pipeline mix %"],
+                                ints=["Open orders"],
+                            ),
+                        )
+
+                # ---- 5) By customer -----------------------------------------
+                with pipe_tabs[4]:
+                    top_n_c = st.slider(
+                        "Show top N customers",
+                        10, 500, 50, 10, key="pipe_cust_n",
+                    )
+                    t = (d_o.groupby("Customer")
+                         .agg(**{
+                             "Total order value": ("Net Value", "sum"),
+                             "Delivered": ("Net Value (Delivered)", "sum"),
+                             "Pending": ("Net Value (Pending)", "sum"),
+                             "Open orders": ("Sales Order", "nunique"),
+                             "Last order": ("Document Date", "max"),
+                         }).reset_index())
+                    t["Delivered %"] = np.where(
+                        t["Total order value"] != 0,
+                        t["Delivered"] / t["Total order value"] * 100, 0)
+                    t = t.sort_values("Pending", ascending=False).head(top_n_c)
+                    t.insert(0, "Rank", range(1, len(t) + 1))
+
+                    cfg = build_col_config(
+                        t, currency,
+                        money=["Total order value", "Delivered", "Pending"],
+                        pct=["Delivered %"],
+                        ints=["Rank", "Open orders"],
+                    )
+                    if "Last order" in t.columns:
+                        cfg["Last order"] = st.column_config.DateColumn(
+                            "Last order", format="DD MMM YYYY"
+                        )
+                    st.dataframe(
+                        t, hide_index=True, use_container_width=True,
+                        column_config=cfg,
+                    )
+
+                # ---- 6) By product / manufacturer ---------------------------
+                with pipe_tabs[5]:
+                    sub = st.tabs(["Product group", "Manufacturer", "Product"])
+
+                    with sub[0]:
+                        if "Product Group" in d_o.columns:
+                            t = (d_o.groupby("Product Group")
+                                 .agg(**{
+                                     "Total order value": ("Net Value", "sum"),
+                                     "Pending": ("Net Value (Pending)", "sum"),
+                                     "Open orders": ("Sales Order", "nunique"),
+                                     "Distinct products":
+                                         ("Product Id", "nunique"),
+                                 }).reset_index()
+                                 .sort_values("Pending", ascending=False))
+                            st.dataframe(
+                                t, hide_index=True, use_container_width=True,
+                                column_config=build_col_config(
+                                    t, currency,
+                                    money=["Total order value", "Pending"],
+                                    ints=["Open orders", "Distinct products"],
+                                ),
+                            )
+
+                    with sub[1]:
+                        if "Manufacturer Name" in d_o.columns:
+                            t = (d_o.groupby("Manufacturer Name")
+                                 .agg(**{
+                                     "Total order value": ("Net Value", "sum"),
+                                     "Pending": ("Net Value (Pending)", "sum"),
+                                     "Open orders": ("Sales Order", "nunique"),
+                                     "Distinct products":
+                                         ("Product Id", "nunique"),
+                                 }).reset_index()
+                                 .rename(columns={"Manufacturer Name":
+                                                  "Manufacturer"})
+                                 .sort_values("Pending", ascending=False))
+                            st.dataframe(
+                                t, hide_index=True, use_container_width=True,
+                                column_config=build_col_config(
+                                    t, currency,
+                                    money=["Total order value", "Pending"],
+                                    ints=["Open orders", "Distinct products"],
+                                ),
+                            )
+
+                    with sub[2]:
+                        if "Product Id" in d_o.columns:
+                            top_n_p = st.slider(
+                                "Top N products",
+                                10, 500, 50, 10, key="pipe_prod_n",
+                            )
+                            grp = ["Product Id"]
+                            if "Product Desc" in d_o.columns:
+                                grp.append("Product Desc")
+                            t = (d_o.groupby(grp)
+                                 .agg(**{
+                                     "Total order value": ("Net Value", "sum"),
+                                     "Pending": ("Net Value (Pending)", "sum"),
+                                     "Pending units":
+                                         ("Pending Quantity", "sum"),
+                                     "Open orders": ("Sales Order", "nunique"),
+                                 }).reset_index()
+                                 .sort_values("Pending", ascending=False)
+                                 .head(top_n_p))
+                            st.dataframe(
+                                t, hide_index=True, use_container_width=True,
+                                column_config=build_col_config(
+                                    t, currency,
+                                    money=["Total order value", "Pending"],
+                                    ints=["Pending units", "Open orders"],
+                                ),
+                            )
+
+                # ---- 7) Aging -----------------------------------------------
+                with pipe_tabs[6]:
+                    st.markdown(
+                        "Open order lines bucketed by age. Age is measured "
+                        "from **Requested Delivery Date** when available, "
+                        "else from **Document Date**. Negative age means "
+                        "the order is past its requested delivery."
+                    )
+                    today = pd.Timestamp.today().normalize()
+                    open_only = d_o[d_o["Net Value (Pending)"] > 0].copy() \
+                        if "Net Value (Pending)" in d_o.columns else d_o.copy()
+
+                    if open_only.empty:
+                        st.info("No open order lines.")
+                    else:
+                        ref_date = open_only.get(
+                            "Requested Delivery Date",
+                            open_only.get("Document Date"),
+                        )
+                        if "Requested Delivery Date" in open_only.columns:
+                            open_only["Days to delivery"] = (
+                                open_only["Requested Delivery Date"] - today
+                            ).dt.days
+                        elif "Document Date" in open_only.columns:
+                            open_only["Days to delivery"] = (
+                                today - open_only["Document Date"]
+                            ).dt.days * -1
+
+                        def _bucket(d):
+                            if pd.isna(d):
+                                return "Unknown"
+                            if d < -90:
+                                return "Overdue 90+ days"
+                            if d < -30:
+                                return "Overdue 30-90 days"
+                            if d < 0:
+                                return "Overdue 0-30 days"
+                            if d <= 30:
+                                return "Due within 30 days"
+                            if d <= 90:
+                                return "Due in 30-90 days"
+                            return "Due 90+ days out"
+
+                        open_only["Bucket"] = open_only["Days to delivery"].apply(_bucket)
+                        bucket_order = [
+                            "Overdue 90+ days", "Overdue 30-90 days",
+                            "Overdue 0-30 days", "Due within 30 days",
+                            "Due in 30-90 days", "Due 90+ days out",
+                            "Unknown",
+                        ]
+                        agg = (open_only.groupby("Bucket")
+                               .agg(**{
+                                   "Pending": ("Net Value (Pending)", "sum"),
+                                   "Open orders": ("Sales Order", "nunique"),
+                                   "Lines": ("Sales Order", "size"),
+                                   "Customers": ("Customer", "nunique"),
+                                   "Employees":
+                                       ("Sales Empl. Name", "nunique"),
+                               }).reset_index())
+                        agg["Bucket"] = pd.Categorical(
+                            agg["Bucket"], categories=bucket_order, ordered=True,
+                        )
+                        agg = agg.sort_values("Bucket")
+                        agg["% of pipeline"] = np.where(
+                            pipe["pending_value"],
+                            agg["Pending"] / pipe["pending_value"] * 100, 0)
+                        st.dataframe(
+                            agg, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                agg, currency,
+                                money=["Pending"],
+                                pct=["% of pipeline"],
+                                ints=["Open orders", "Lines",
+                                      "Customers", "Employees"],
+                            ),
+                        )
+
+                # ---- 8) Time trend ------------------------------------------
+                with pipe_tabs[7]:
+                    if "Document Date" not in d_o.columns:
+                        st.info("No date data on orders.")
+                    else:
+                        gran = st.radio(
+                            "Granularity",
+                            ["Daily", "Weekly", "Monthly", "Quarterly"],
+                            index=2, horizontal=True, key="pipe_gran",
+                        )
+                        d2 = d_o.copy()
+                        if gran == "Daily":
+                            d2["Period"] = d2["Document Date"].dt.date.astype(str)
+                        elif gran == "Weekly":
+                            d2["Period"] = (
+                                d2["Document Date"].dt.to_period("W")
+                                .apply(lambda p: p.start_time.strftime("%Y-%m-%d"))
+                            )
+                        elif gran == "Monthly":
+                            d2["Period"] = (
+                                d2["Document Date"].dt.to_period("M").astype(str)
+                            )
+                        else:
+                            d2["Period"] = (
+                                d2["Document Date"].dt.to_period("Q").astype(str)
+                            )
+                        t = (d2.groupby("Period")
+                             .agg(**{
+                                 "Total order value": ("Net Value", "sum"),
+                                 "Delivered": ("Net Value (Delivered)", "sum"),
+                                 "Pending": ("Net Value (Pending)", "sum"),
+                                 "Open orders": ("Sales Order", "nunique"),
+                             }).reset_index()
+                             .sort_values("Period"))
+                        st.dataframe(
+                            t, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                t, currency,
+                                money=["Total order value", "Delivered", "Pending"],
+                                ints=["Open orders"],
+                            ),
+                        )
+                        with st.expander("Optional: tiny chart"):
+                            try:
+                                chart_df = t.set_index("Period")[
+                                    ["Pending", "Delivered"]
+                                ]
+                                st.bar_chart(chart_df, height=260)
+                            except Exception:
+                                st.write("Chart unavailable.")
+
+                # ---- 9) Raw orders ------------------------------------------
+                with pipe_tabs[8]:
+                    st.markdown(
+                        f"<span class='muted'>{len(d_o):,} order lines after "
+                        "filters. Click column headers to sort.</span>",
+                        unsafe_allow_html=True,
+                    )
+                    cols = [c for c in [
+                        "Sales Order", "Document Date",
+                        "Requested Delivery Date", "Division", "Sub-team",
+                        "Sales Empl. Name", "Customer", "City Name",
+                        "Product Id", "Product Desc", "Product Group",
+                        "Manufacturer Name", "Order Quantity", "Net Price",
+                        "Net Value", "Delivered Quantity",
+                        "Net Value (Delivered)", "Pending Quantity",
+                        "Net Value (Pending)",
+                    ] if c in d_o.columns]
+                    show_orders = d_o[cols].copy()
+                    cfg = build_col_config(
+                        show_orders, currency,
+                        money=["Net Price", "Net Value",
+                               "Net Value (Delivered)", "Net Value (Pending)"],
+                        ints=["Order Quantity", "Delivered Quantity",
+                              "Pending Quantity"],
+                    )
+                    if "Document Date" in show_orders.columns:
+                        cfg["Document Date"] = st.column_config.DateColumn(
+                            "Document Date", format="DD MMM YYYY",
+                        )
+                    if "Requested Delivery Date" in show_orders.columns:
+                        cfg["Requested Delivery Date"] = \
+                            st.column_config.DateColumn(
+                                "Requested Delivery Date",
+                                format="DD MMM YYYY",
+                            )
+                    st.dataframe(
+                        show_orders, hide_index=True,
+                        use_container_width=True,
+                        column_config=cfg, height=520,
+                    )
+                    csv_o = show_orders.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download filtered orders (CSV)",
+                        data=csv_o,
+                        file_name=(
+                            f"orders_filtered_{start_d.isoformat()}"
+                            f"_to_{end_d.isoformat()}.csv"
+                        ),
+                        mime="text/csv",
+                    )
+
+
 # ---------- Tab: Departments -----------------------------------------------
-with tabs[1]:
+with tabs[_tab_idx["Departments"]]:
     st.subheader("Department / Division breakdown")
     if "Division" not in df.columns or df.empty:
         st.info("No data for current filters.")
@@ -777,7 +1572,7 @@ with tabs[1]:
 
 
 # ---------- Tab: Employees -------------------------------------------------
-with tabs[2]:
+with tabs[_tab_idx["Employees"]]:
     st.subheader("Sales employee leaderboard")
     if "Sales Empl. Name" not in df.columns or df.empty:
         st.info("No data for current filters.")
@@ -836,7 +1631,7 @@ with tabs[2]:
 
 
 # ---------- Tab: Customers -------------------------------------------------
-with tabs[3]:
+with tabs[_tab_idx["Customers"]]:
     st.subheader("Customer breakdown")
     if "Customer" not in df.columns or df.empty:
         st.info("No data for current filters.")
@@ -874,7 +1669,7 @@ with tabs[3]:
 
 
 # ---------- Tab: Products --------------------------------------------------
-with tabs[4]:
+with tabs[_tab_idx["Products"]]:
     st.subheader("Products & manufacturers")
     if df.empty:
         st.info("No data for current filters.")
@@ -960,7 +1755,7 @@ with tabs[4]:
 
 
 # ---------- Tab: Geography -------------------------------------------------
-with tabs[5]:
+with tabs[_tab_idx["Geography"]]:
     st.subheader("Geography breakdown")
     if "City Name" not in df.columns or df.empty:
         st.info("No city data available for current filters.")
@@ -992,7 +1787,7 @@ with tabs[5]:
 
 
 # ---------- Tab: Time trend ------------------------------------------------
-with tabs[6]:
+with tabs[_tab_idx["Time trend"]]:
     st.subheader("Performance over time")
     if "Billing Date" not in df.columns or df.empty:
         st.info("No date data for current filters.")
@@ -1044,7 +1839,7 @@ with tabs[6]:
 
 
 # ---------- Tab: Raw data --------------------------------------------------
-with tabs[7]:
+with tabs[_tab_idx["Raw data"]]:
     st.subheader("Filtered transactions")
     st.markdown(
         f"<span class='muted'>{len(df):,} rows after filters. "
@@ -1096,9 +1891,17 @@ with tabs[7]:
 # Footer
 # =============================================================================
 st.markdown("<hr style='margin-top: 2rem; border-color: #e6e8ed;'>", unsafe_allow_html=True)
-st.markdown(
-    f"<span class='muted'>Source file: <b>{source_name}</b> &nbsp;&middot;&nbsp; "
-    f"Total rows in file: <b>{len(df_full):,}</b> &nbsp;&middot;&nbsp; "
-    f"Net sales (all time): <b>{fmt_money(m_all['sales'], currency)}</b></span>",
-    unsafe_allow_html=True,
+_footer = (
+    f"<span class='muted'>Sales source: <b>{source_name}</b> "
+    f"({len(df_full):,} rows) &nbsp;&middot;&nbsp; "
+    f"Net sales (all time): <b>{fmt_money(m_all['sales'], currency)}</b>"
 )
+if df_orders_full is not None and orders_source:
+    mo_all = order_kpis(df_orders_full)
+    _footer += (
+        f" &nbsp;&middot;&nbsp; Orders source: <b>{orders_source}</b> "
+        f"({len(df_orders_full):,} lines) &nbsp;&middot;&nbsp; "
+        f"Pipeline (all time): <b>{fmt_money(mo_all['pending_value'], currency)}</b>"
+    )
+_footer += "</span>"
+st.markdown(_footer, unsafe_allow_html=True)

@@ -29,5 +29,13 @@ desktop.ini
 ~$*.xlsx
 ~$*.xls
 
+# Source business-data files - keep out of public repo
+Sales Report*.xlsx
+Sales Report*.xls
+Sales Report*.csv
+Secured orders*.xlsx
+Secured orders*.xls
+Secured orders*.csv
+
 # Misc
 *.log
