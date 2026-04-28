@@ -482,9 +482,21 @@ st.sidebar.markdown("---")
 st.sidebar.header("Filters")
 
 # Date range
+# Use the UNION of date ranges across the sales file and (when present)
+# the secured-orders file, so "All time" really covers everything.
+_date_minmax: list[date] = []
 if "Billing Date" in df_full.columns and df_full["Billing Date"].notna().any():
-    min_date = df_full["Billing Date"].min().date()
-    max_date = df_full["Billing Date"].max().date()
+    _date_minmax.append(df_full["Billing Date"].min().date())
+    _date_minmax.append(df_full["Billing Date"].max().date())
+if (df_orders_full is not None
+        and "Document Date" in df_orders_full.columns
+        and df_orders_full["Document Date"].notna().any()):
+    _date_minmax.append(df_orders_full["Document Date"].min().date())
+    _date_minmax.append(df_orders_full["Document Date"].max().date())
+
+if _date_minmax:
+    min_date = min(_date_minmax)
+    max_date = max(_date_minmax)
 else:
     min_date = max_date = date.today()
 
@@ -557,6 +569,26 @@ include_credits = st.sidebar.checkbox(
     help="Uncheck to view only invoices.",
 )
 
+# How should the sidebar date range apply to the secured-orders file?
+# Default to "All open orders" so the Pipeline view reflects the full
+# backlog of unfulfilled work regardless of when orders were booked,
+# which matches how "pipeline" is normally read.
+if df_orders_full is not None and not df_orders_full.empty:
+    orders_date_mode = st.sidebar.radio(
+        "Pipeline period filter",
+        options=["All open orders (no date filter)",
+                 "Filter by Document Date",
+                 "Filter by Requested Delivery Date"],
+        index=0,
+        help=(
+            "Pipeline normally means 'all unfulfilled work'. Switch to a "
+            "date-filtered mode if you want to measure orders booked "
+            "(or due) inside the selected period only."
+        ),
+    )
+else:
+    orders_date_mode = "All open orders (no date filter)"
+
 # Apply filters
 df = df_full.copy()
 if "Billing Date" in df.columns:
@@ -588,12 +620,23 @@ if not include_credits and "Billing Type" in df.columns:
 df_orders = None
 if df_orders_full is not None and not df_orders_full.empty:
     df_orders = df_orders_full.copy()
-    if "Document Date" in df_orders.columns:
+
+    if orders_date_mode == "Filter by Document Date" \
+            and "Document Date" in df_orders.columns:
         m_o = (
             (df_orders["Document Date"].dt.date >= start_d)
             & (df_orders["Document Date"].dt.date <= end_d)
         )
         df_orders = df_orders[m_o | df_orders["Document Date"].isna()]
+    elif orders_date_mode == "Filter by Requested Delivery Date" \
+            and "Requested Delivery Date" in df_orders.columns:
+        m_o = (
+            (df_orders["Requested Delivery Date"].dt.date >= start_d)
+            & (df_orders["Requested Delivery Date"].dt.date <= end_d)
+        )
+        df_orders = df_orders[m_o | df_orders["Requested Delivery Date"].isna()]
+    # else: "All open orders (no date filter)" -> no date filtering applied
+
     df_orders = apply_in(df_orders, "Division", f_div)
     df_orders = apply_in(df_orders, "Sub-team", f_subteam)
     df_orders = apply_in(df_orders, "Sales Empl. Name", f_emp)
@@ -634,10 +677,26 @@ for label, vals in [
         v_disp = vals[0] if len(vals) == 1 else f"{len(vals)} selected"
         filter_pills += f"<span class='pill'>{label}: {v_disp}</span>"
 
+_pipeline_pill = ""
+if df_orders is not None and not df_orders.empty:
+    if orders_date_mode == "All open orders (no date filter)":
+        _pipeline_pill = (
+            "<span class='pill'>Pipeline: all open orders</span>"
+        )
+    elif orders_date_mode == "Filter by Document Date":
+        _pipeline_pill = (
+            "<span class='pill'>Pipeline: orders booked in period</span>"
+        )
+    else:
+        _pipeline_pill = (
+            "<span class='pill'>Pipeline: deliveries due in period</span>"
+        )
+
 st.markdown(
     f"<span class='pill'>Period: {period_label}</span>"
     f"<span class='pill'>{days_n} days</span>"
     f"<span class='pill'>{len(df):,} line items</span>"
+    + _pipeline_pill
     + filter_pills,
     unsafe_allow_html=True,
 )
@@ -997,11 +1056,22 @@ if "Pipeline" in _tab_idx:
 
                 # ---- 4) Combined (billed + pipeline) ------------------------
                 with pipe_tabs[3]:
+                    _billed_scope = (
+                        f"period {start_d.strftime('%d %b %Y')} - "
+                        f"{end_d.strftime('%d %b %Y')}"
+                    )
+                    if orders_date_mode == "All open orders (no date filter)":
+                        _pipe_scope = "all open orders (any date)"
+                    elif orders_date_mode == "Filter by Document Date":
+                        _pipe_scope = "orders booked in selected period"
+                    else:
+                        _pipe_scope = "deliveries due in selected period"
                     st.markdown(
-                        "**Billed sales** come from the sales report (already "
-                        "invoiced). **Pending** comes from the secured-orders "
-                        "file (open / not yet completed). Both are filtered "
-                        "by the same period and division/employee filters."
+                        f"**Billed sales** = invoiced sales for **{_billed_scope}**. "
+                        f"**Pending** = open pipeline ({_pipe_scope}). "
+                        "Division/employee filters apply to both. "
+                        "Use the *Pipeline period filter* in the sidebar "
+                        "to change how the date range applies to orders."
                     )
                     if "Sales Empl. Name" in df.columns and "Sales Empl. Name" in d_o.columns:
                         billed = (df.groupby("Sales Empl. Name")
