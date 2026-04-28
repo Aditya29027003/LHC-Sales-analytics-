@@ -37,6 +37,50 @@ EXPECTED_COLUMNS = [
     "Cost (Actual)", "Profit Margin", "Profit Margin Ratio", "City Name",
 ]
 
+# -----------------------------------------------------------------------------
+# Sub-team mapping
+# -----------------------------------------------------------------------------
+# Some divisions are organised into smaller sub-teams. Add new divisions here
+# in the same shape and the Departments tab will automatically show a sub-team
+# breakdown when that division is selected.
+#
+# Format:  Division name (exact match) -> { Sub-team name -> [employee, ...] }
+# Employees not listed for a mapped division are bucketed under
+# "Other / Unassigned" so nothing silently disappears.
+SUB_TEAM_MAP: dict[str, dict[str, list[str]]] = {
+    "WSH (LB)": {
+        "Dermatology": [
+            "Vishnu T.V", "Sathish Kumar", "Abel Forbes", "Kit Aranas",
+        ],
+        "Life Sciences": [
+            "Piyush Yadav", "Ramadan Youssef", "Mohammed Kamal",
+            "Gopinath Sarangapani", "Ayyaz Khan",
+        ],
+        "Medical Division": [
+            "Aldrich Gaupo Torres", "Shameem Arakkal Hydros",
+            "Awaad Othmaan", "Mohammed Thwaha",
+        ],
+    },
+    # Add other divisions here later, e.g.:
+    # "MedDivision (L9)": { "Team A": [...], "Team B": [...] },
+}
+
+
+def assign_sub_team(division: str, employee: str) -> str:
+    """Return the sub-team name for (division, employee).
+
+    Returns "-" when the division has no sub-team configuration, or
+    "Other / Unassigned" when the employee isn't listed in any sub-team
+    of a mapped division.
+    """
+    mapping = SUB_TEAM_MAP.get(str(division))
+    if not mapping:
+        return "-"
+    for team, members in mapping.items():
+        if str(employee) in members:
+            return team
+    return "Other / Unassigned"
+
 st.markdown(
     """
     <style>
@@ -138,6 +182,12 @@ def load_data(source, name: str) -> pd.DataFrame:
         df["City Name"] = df["City Name"].replace(
             {"nan": "Unknown", "": "Unknown", "None": "Unknown"}
         )
+
+    if "Division" in df.columns and "Sales Empl. Name" in df.columns:
+        df["Sub-team"] = [
+            assign_sub_team(d, e)
+            for d, e in zip(df["Division"], df["Sales Empl. Name"])
+        ]
 
     return df
 
@@ -328,6 +378,19 @@ def msel(label: str, col: str) -> list[str]:
 
 
 f_div = msel("Department / Division", "Division")
+
+# Sub-team filter only shown when at least one mapped sub-team has rows.
+f_subteam: list[str] = []
+if "Sub-team" in df_full.columns:
+    available_subteams = sorted([
+        s for s in df_full["Sub-team"].dropna().astype(str).unique()
+        if s and s != "-"
+    ])
+    if available_subteams:
+        f_subteam = st.sidebar.multiselect(
+            "Sub-team", options=available_subteams, default=[]
+        )
+
 f_emp = msel("Sales Employee", "Sales Empl. Name")
 f_pg = msel("Product Group", "Product Group")
 f_man = msel("Manufacturer", "Manufacturer Name")
@@ -355,6 +418,7 @@ def apply_in(d: pd.DataFrame, col: str, vals: list[str]) -> pd.DataFrame:
 
 
 df = apply_in(df, "Division", f_div)
+df = apply_in(df, "Sub-team", f_subteam)
 df = apply_in(df, "Sales Empl. Name", f_emp)
 df = apply_in(df, "Product Group", f_pg)
 df = apply_in(df, "Manufacturer Name", f_man)
@@ -383,7 +447,8 @@ days_n = (end_d - start_d).days + 1
 
 filter_pills = ""
 for label, vals in [
-    ("Division", f_div), ("Employee", f_emp), ("Product group", f_pg),
+    ("Division", f_div), ("Sub-team", f_subteam),
+    ("Employee", f_emp), ("Product group", f_pg),
     ("Manufacturer", f_man), ("City", f_city),
     ("Billing type", f_btype), ("Customer", f_cust),
 ]:
@@ -592,7 +657,95 @@ with tabs[1]:
         )
         sub = df if div_pick == "(all)" else df[df["Division"] == div_pick]
 
-        if "Sales Empl. Name" in sub.columns and not sub.empty:
+        # If a single division with a sub-team mapping is selected,
+        # show the sub-team summary first, then the per-employee rows.
+        has_sub_teams = (
+            div_pick != "(all)"
+            and div_pick in SUB_TEAM_MAP
+            and "Sub-team" in sub.columns
+            and not sub.empty
+        )
+
+        if has_sub_teams:
+            st.markdown(f"**Sub-team summary - {div_pick}**")
+            st_agg = (sub.groupby("Sub-team")
+                      .agg(**{
+                          "Net sales": ("Net Sales Volume", "sum"),
+                          "Cost": ("Cost (Actual)", "sum"),
+                          "Profit": ("Profit Margin", "sum"),
+                          "Units": ("Quantity (Actual)", "sum"),
+                          "Invoices": ("Billing Document", "nunique"),
+                          "Customers": ("Customer", "nunique"),
+                          "Employees": ("Sales Empl. Name", "nunique"),
+                      }).reset_index())
+            st_agg["Margin %"] = np.where(
+                st_agg["Net sales"] != 0,
+                st_agg["Profit"] / st_agg["Net sales"] * 100, 0,
+            )
+            div_sales = float(st_agg["Net sales"].sum())
+            st_agg["% of dept sales"] = np.where(
+                div_sales, st_agg["Net sales"] / div_sales * 100, 0,
+            )
+            st_agg = st_agg.sort_values("Net sales", ascending=False)
+
+            st_total = pd.DataFrame([{
+                "Sub-team": "-- TOTAL --",
+                "Net sales": st_agg["Net sales"].sum(),
+                "Cost": st_agg["Cost"].sum(),
+                "Profit": st_agg["Profit"].sum(),
+                "Units": st_agg["Units"].sum(),
+                "Invoices": int(sub["Billing Document"].nunique()),
+                "Customers": int(sub["Customer"].nunique()),
+                "Employees": int(sub["Sales Empl. Name"].nunique()),
+                "Margin %": (st_agg["Profit"].sum() / st_agg["Net sales"].sum() * 100)
+                if st_agg["Net sales"].sum() else 0,
+                "% of dept sales": 100.0,
+            }])
+            st_out = pd.concat([st_agg, st_total], ignore_index=True)
+
+            st.dataframe(
+                st_out, hide_index=True, use_container_width=True,
+                column_config=build_col_config(
+                    st_out, currency,
+                    money=["Net sales", "Cost", "Profit"],
+                    pct=["Margin %", "% of dept sales"],
+                    ints=["Units", "Invoices", "Customers", "Employees"],
+                ),
+            )
+
+            st.write("")
+            st.markdown(f"**Employees by sub-team - {div_pick}**")
+            sub_team_pick = st.selectbox(
+                "Sub-team",
+                options=["(all sub-teams)"] + st_agg["Sub-team"].tolist(),
+            )
+            sub2 = sub if sub_team_pick == "(all sub-teams)" \
+                else sub[sub["Sub-team"] == sub_team_pick]
+
+            t = (sub2.groupby(["Sub-team", "Sales Empl. Name"])
+                 .agg(**{
+                     "Net sales": ("Net Sales Volume", "sum"),
+                     "Profit": ("Profit Margin", "sum"),
+                     "Units": ("Quantity (Actual)", "sum"),
+                     "Invoices": ("Billing Document", "nunique"),
+                     "Customers": ("Customer", "nunique"),
+                 }).reset_index())
+            t["Margin %"] = np.where(t["Net sales"] != 0,
+                                     t["Profit"] / t["Net sales"] * 100, 0)
+            t = t.sort_values(["Sub-team", "Net sales"],
+                              ascending=[True, False])
+            t = t.rename(columns={"Sales Empl. Name": "Employee"})
+            st.dataframe(
+                t, hide_index=True, use_container_width=True,
+                column_config=build_col_config(
+                    t, currency,
+                    money=["Net sales", "Profit"],
+                    pct=["Margin %"],
+                    ints=["Units", "Invoices", "Customers"],
+                ),
+            )
+
+        elif "Sales Empl. Name" in sub.columns and not sub.empty:
             t = (sub.groupby(["Division", "Sales Empl. Name"])
                  .agg(**{
                      "Net sales": ("Net Sales Volume", "sum"),
@@ -615,6 +768,13 @@ with tabs[1]:
                 ),
             )
 
+            if div_pick == "(all)":
+                st.caption(
+                    "Tip: pick a single department above to see its sub-team "
+                    "breakdown (configured for "
+                    f"{', '.join(sorted(SUB_TEAM_MAP.keys())) or 'no departments yet'})."
+                )
+
 
 # ---------- Tab: Employees -------------------------------------------------
 with tabs[2]:
@@ -628,7 +788,14 @@ with tabs[2]:
                      "Units", "Customers"],
             index=0,
         )
-        agg = (df.groupby("Sales Empl. Name")
+
+        has_subteam_col = "Sub-team" in df.columns
+
+        group_cols = ["Sales Empl. Name"]
+        if has_subteam_col:
+            group_cols = ["Sales Empl. Name", "Sub-team"]
+
+        agg = (df.groupby(group_cols, dropna=False)
                .agg(**{
                    "Net sales": ("Net Sales Volume", "sum"),
                    "Cost": ("Cost (Actual)", "sum"),
@@ -649,6 +816,13 @@ with tabs[2]:
         agg = agg.sort_values(sort_by, ascending=False)
         agg = agg.rename(columns={"Sales Empl. Name": "Employee"})
         agg.insert(0, "Rank", range(1, len(agg) + 1))
+
+        if has_subteam_col:
+            display_cols = ["Rank", "Employee", "Sub-team",
+                            "Net sales", "Cost", "Profit", "Margin %",
+                            "Avg invoice value", "Units", "Invoices",
+                            "Customers", "Departments", "% of period sales"]
+            agg = agg[[c for c in display_cols if c in agg.columns]]
 
         st.dataframe(
             agg, hide_index=True, use_container_width=True,

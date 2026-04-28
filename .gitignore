@@ -25,5 +25,9 @@ ENV/
 Thumbs.db
 desktop.ini
 
+# Excel lock files (created when a workbook is open in Excel)
+~$*.xlsx
+~$*.xls
+
 # Misc
 *.log
