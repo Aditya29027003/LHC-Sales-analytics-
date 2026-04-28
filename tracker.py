@@ -920,20 +920,23 @@ if "Pipeline" in _tab_idx:
                 st.markdown("---")
 
                 # ---- Pipeline sub-tabs --------------------------------------
-                pipe_tabs = st.tabs([
+                _pipe_labels = [
                     "By department",
                     "By sub-team",
                     "By employee",
+                    "By dept + employee",
                     "Combined (billed + pipeline)",
                     "By customer",
                     "By product / manufacturer",
                     "Aging",
                     "Time trend",
                     "Raw orders",
-                ])
+                ]
+                pipe_tabs = st.tabs(_pipe_labels)
+                _p = {label: i for i, label in enumerate(_pipe_labels)}
 
-                # ---- 1) By department ---------------------------------------
-                with pipe_tabs[0]:
+                # ---- By department ------------------------------------------
+                with pipe_tabs[_p["By department"]]:
                     if "Division" in d_o.columns:
                         t = (d_o.groupby("Division")
                              .agg(**{
@@ -980,8 +983,8 @@ if "Pipeline" in _tab_idx:
                             ),
                         )
 
-                # ---- 2) By sub-team -----------------------------------------
-                with pipe_tabs[1]:
+                # ---- By sub-team --------------------------------------------
+                with pipe_tabs[_p["By sub-team"]]:
                     if "Sub-team" not in d_o.columns:
                         st.info("No sub-team data.")
                     else:
@@ -1015,8 +1018,8 @@ if "Pipeline" in _tab_idx:
                             ),
                         )
 
-                # ---- 3) By employee -----------------------------------------
-                with pipe_tabs[2]:
+                # ---- By employee --------------------------------------------
+                with pipe_tabs[_p["By employee"]]:
                     sort_pipe = st.selectbox(
                         "Sort employees by",
                         options=["Pending", "Total order value",
@@ -1054,8 +1057,124 @@ if "Pipeline" in _tab_idx:
                         ),
                     )
 
-                # ---- 4) Combined (billed + pipeline) ------------------------
-                with pipe_tabs[3]:
+                # ---- By dept + employee (combined) --------------------------
+                with pipe_tabs[_p["By dept + employee"]]:
+                    st.markdown(
+                        "Every employee grouped under their **department**. "
+                        "Reps are ranked within their own department, with a "
+                        "rolled-up department total at the bottom of each "
+                        "group. Useful when you want to see how a team's reps "
+                        "stack against each other rather than across the "
+                        "whole company."
+                    )
+                    if "Division" not in d_o.columns or "Sales Empl. Name" not in d_o.columns:
+                        st.info("Department or employee column missing.")
+                    else:
+                        sort_de = st.selectbox(
+                            "Sort employees within each department by",
+                            options=["Pending", "Total order value",
+                                     "Delivered", "Open orders"],
+                            index=0, key="pipe_dept_emp_sort",
+                        )
+                        group_cols_de = ["Division", "Sales Empl. Name"]
+                        if "Sub-team" in d_o.columns:
+                            group_cols_de.append("Sub-team")
+                        t_de = (d_o.groupby(group_cols_de, dropna=False)
+                                .agg(**{
+                                    "Total order value": ("Net Value", "sum"),
+                                    "Delivered": ("Net Value (Delivered)", "sum"),
+                                    "Pending": ("Net Value (Pending)", "sum"),
+                                    "Open orders": ("Sales Order", "nunique"),
+                                    "Customers": ("Customer", "nunique"),
+                                }).reset_index())
+                        t_de["Delivered %"] = np.where(
+                            t_de["Total order value"] != 0,
+                            t_de["Delivered"] / t_de["Total order value"] * 100, 0)
+                        t_de["% of pipeline"] = np.where(
+                            pipe["pending_value"],
+                            t_de["Pending"] / pipe["pending_value"] * 100, 0)
+
+                        # Department-level totals for the % of dept share
+                        dept_totals = (t_de.groupby("Division")["Pending"]
+                                       .sum().to_dict())
+                        t_de["% of dept pending"] = t_de.apply(
+                            lambda r: (
+                                r["Pending"] / dept_totals[r["Division"]] * 100
+                            ) if dept_totals.get(r["Division"]) else 0,
+                            axis=1,
+                        )
+
+                        # Sort: Division alpha, then chosen metric desc inside
+                        t_de = t_de.sort_values(
+                            ["Division", sort_de],
+                            ascending=[True, False],
+                        )
+                        # Rank within each department
+                        t_de.insert(0, "Rank in dept",
+                                    t_de.groupby("Division").cumcount() + 1)
+
+                        # Build a department-total summary row inserted after
+                        # each department group, for at-a-glance reading
+                        rows: list[pd.Series | dict] = []
+                        for div, sub in t_de.groupby("Division", sort=False):
+                            for _, r in sub.iterrows():
+                                rows.append(r.to_dict())
+                            rows.append({
+                                "Rank in dept": "",
+                                "Division": div,
+                                "Sales Empl. Name": "-- Department total --",
+                                "Sub-team": "",
+                                "Total order value": sub["Total order value"].sum(),
+                                "Delivered": sub["Delivered"].sum(),
+                                "Pending": sub["Pending"].sum(),
+                                "Open orders": int(
+                                    d_o.loc[d_o["Division"] == div,
+                                            "Sales Order"].nunique()
+                                ),
+                                "Customers": int(
+                                    d_o.loc[d_o["Division"] == div,
+                                            "Customer"].nunique()
+                                ),
+                                "Delivered %": (
+                                    sub["Delivered"].sum()
+                                    / sub["Total order value"].sum() * 100
+                                ) if sub["Total order value"].sum() else 0,
+                                "% of pipeline": (
+                                    sub["Pending"].sum()
+                                    / pipe["pending_value"] * 100
+                                ) if pipe["pending_value"] else 0,
+                                "% of dept pending": 100.0,
+                            })
+                        out_de = pd.DataFrame(rows)
+                        out_de = out_de.rename(
+                            columns={"Sales Empl. Name": "Employee",
+                                     "Division": "Department"}
+                        )
+
+                        display_de = ["Rank in dept", "Department", "Employee"]
+                        if "Sub-team" in out_de.columns:
+                            display_de.append("Sub-team")
+                        display_de += ["Pending", "Total order value",
+                                       "Delivered", "Delivered %",
+                                       "% of dept pending", "% of pipeline",
+                                       "Open orders", "Customers"]
+                        out_de = out_de[[c for c in display_de
+                                         if c in out_de.columns]]
+
+                        st.dataframe(
+                            out_de, hide_index=True, use_container_width=True,
+                            column_config=build_col_config(
+                                out_de, currency,
+                                money=["Total order value", "Delivered", "Pending"],
+                                pct=["Delivered %", "% of dept pending",
+                                     "% of pipeline"],
+                                ints=["Open orders", "Customers"],
+                            ),
+                            height=560,
+                        )
+
+                # ---- Combined (billed + pipeline) ---------------------------
+                with pipe_tabs[_p["Combined (billed + pipeline)"]]:
                     _billed_scope = (
                         f"period {start_d.strftime('%d %b %Y')} - "
                         f"{end_d.strftime('%d %b %Y')}"
@@ -1175,8 +1294,8 @@ if "Pipeline" in _tab_idx:
                             ),
                         )
 
-                # ---- 5) By customer -----------------------------------------
-                with pipe_tabs[4]:
+                # ---- By customer --------------------------------------------
+                with pipe_tabs[_p["By customer"]]:
                     top_n_c = st.slider(
                         "Show top N customers",
                         10, 500, 50, 10, key="pipe_cust_n",
@@ -1210,8 +1329,8 @@ if "Pipeline" in _tab_idx:
                         column_config=cfg,
                     )
 
-                # ---- 6) By product / manufacturer ---------------------------
-                with pipe_tabs[5]:
+                # ---- By product / manufacturer ------------------------------
+                with pipe_tabs[_p["By product / manufacturer"]]:
                     sub = st.tabs(["Product group", "Manufacturer", "Product"])
 
                     with sub[0]:
@@ -1284,8 +1403,8 @@ if "Pipeline" in _tab_idx:
                                 ),
                             )
 
-                # ---- 7) Aging -----------------------------------------------
-                with pipe_tabs[6]:
+                # ---- Aging --------------------------------------------------
+                with pipe_tabs[_p["Aging"]]:
                     st.markdown(
                         "Open order lines bucketed by age. Age is measured "
                         "from **Requested Delivery Date** when available, "
@@ -1361,8 +1480,8 @@ if "Pipeline" in _tab_idx:
                             ),
                         )
 
-                # ---- 8) Time trend ------------------------------------------
-                with pipe_tabs[7]:
+                # ---- Time trend ---------------------------------------------
+                with pipe_tabs[_p["Time trend"]]:
                     if "Document Date" not in d_o.columns:
                         st.info("No date data on orders.")
                     else:
@@ -1412,8 +1531,8 @@ if "Pipeline" in _tab_idx:
                             except Exception:
                                 st.write("Chart unavailable.")
 
-                # ---- 9) Raw orders ------------------------------------------
-                with pipe_tabs[8]:
+                # ---- Raw orders ---------------------------------------------
+                with pipe_tabs[_p["Raw orders"]]:
                     st.markdown(
                         f"<span class='muted'>{len(d_o):,} order lines after "
                         "filters. Click column headers to sort.</span>",
