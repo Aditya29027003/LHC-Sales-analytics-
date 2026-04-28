@@ -1,0 +1,18 @@
+# Streamlit configuration for the LHC Sales Analytics Tracker.
+# These settings apply both locally and when the app is deployed to
+# Streamlit Community Cloud.
+
+[theme]
+base = "dark"
+primaryColor = "#4F8DF7"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1A1F2E"
+textColor = "#E8ECF5"
+font = "sans serif"
+
+[server]
+# Allow up to 200 MB uploads so larger sales reports can be opened.
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
