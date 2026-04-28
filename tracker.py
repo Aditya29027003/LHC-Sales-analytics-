@@ -91,6 +91,51 @@ def assign_sub_team(division: str, employee: str) -> str:
             return team
     return "Other / Unassigned"
 
+
+# -----------------------------------------------------------------------------
+# Department colour palette
+# -----------------------------------------------------------------------------
+# Each division gets a stable colour used in all charts so a team is always
+# recognised by the same shade. Add new divisions here as they appear.
+DEPARTMENT_COLORS: dict[str, str] = {
+    "MedDivision (L9)":     "#4F8DF7",  # blue
+    "Simulation (LA)":      "#F59E0B",  # amber
+    "Life Science (L8)":    "#10B981",  # emerald
+    "WSH (LB)":             "#A855F7",  # violet
+    "Derma HF (L3)":        "#EF4444",  # red
+    "Derma Skincare (L4)":  "#EC4899",  # pink
+    "Derma Equipment (L5)": "#F97316",  # orange
+    "EduTech (L7)":         "#14B8A6",  # teal
+    "Admin (L1)":           "#64748B",  # slate
+}
+DEFAULT_DEPT_COLOR = "#94A3B8"  # neutral fallback for unknown divisions
+
+# Series colours (used wherever a chart compares Billed vs Pending etc.)
+SERIES_COLORS = {
+    "Billed sales":  "#4F8DF7",  # blue
+    "Pending":       "#F59E0B",  # amber
+    "Delivered":     "#10B981",  # emerald
+    "Total order value": "#A855F7",
+    "Net sales":     "#4F8DF7",
+    "Profit":        "#10B981",
+}
+
+# Aging bucket colours (red = bad, green = healthy)
+BUCKET_COLORS = {
+    "Overdue 90+ days":     "#B91C1C",
+    "Overdue 30-90 days":   "#EF4444",
+    "Overdue 0-30 days":    "#F97316",
+    "Due within 30 days":   "#EAB308",
+    "Due in 30-90 days":    "#10B981",
+    "Due 90+ days out":     "#0EA5E9",
+    "Unknown":              "#94A3B8",
+}
+
+
+def dept_color(division: str) -> str:
+    """Return the colour for a division (or a neutral fallback)."""
+    return DEPARTMENT_COLORS.get(str(division), DEFAULT_DEPT_COLOR)
+
 st.markdown(
     """
     <style>
@@ -477,6 +522,13 @@ else:
     )
 
 currency = st.sidebar.text_input("Currency label", value="AED", max_chars=6).strip() or "AED"
+
+show_charts = st.sidebar.checkbox(
+    "Show summary charts",
+    value=True,
+    help="Toggle the headline bar charts on/off (Departments tab, "
+    "Pipeline tab, etc.). The numeric tables stay visible regardless.",
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
@@ -972,6 +1024,15 @@ if "Pipeline" in _tab_idx:
                         }])
                         out = pd.concat([t, total], ignore_index=True)
 
+                        if show_charts and not t.empty:
+                            ch = t[["Division", "Pending"]].copy()
+                            ch["_color"] = ch["Division"].map(dept_color)
+                            st.markdown("**Pending pipeline by department**")
+                            st.bar_chart(
+                                ch, x="Division", y="Pending",
+                                color="_color", horizontal=True, height=320,
+                            )
+
                         st.dataframe(
                             out, hide_index=True, use_container_width=True,
                             column_config=build_col_config(
@@ -982,6 +1043,17 @@ if "Pipeline" in _tab_idx:
                                       "Customers", "Employees"],
                             ),
                         )
+
+                        if show_charts and not t.empty:
+                            with st.expander("More: Delivered vs Pending per department"):
+                                stack = t[["Division", "Delivered", "Pending"]].copy()
+                                st.bar_chart(
+                                    stack, x="Division",
+                                    y=["Delivered", "Pending"], stack=True,
+                                    color=[SERIES_COLORS["Delivered"],
+                                           SERIES_COLORS["Pending"]],
+                                    horizontal=True, height=340,
+                                )
 
                 # ---- By sub-team --------------------------------------------
                 with pipe_tabs[_p["By sub-team"]]:
@@ -1161,6 +1233,22 @@ if "Pipeline" in _tab_idx:
                         out_de = out_de[[c for c in display_de
                                          if c in out_de.columns]]
 
+                        if show_charts and not t_de.empty:
+                            dept_totals_chart = (
+                                t_de.groupby("Division")["Pending"]
+                                .sum().reset_index()
+                                .sort_values("Pending", ascending=False)
+                            )
+                            dept_totals_chart["_color"] = (
+                                dept_totals_chart["Division"].map(dept_color)
+                            )
+                            st.markdown("**Department pipeline totals**")
+                            st.bar_chart(
+                                dept_totals_chart,
+                                x="Division", y="Pending",
+                                color="_color", horizontal=True, height=300,
+                            )
+
                         st.dataframe(
                             out_de, hide_index=True, use_container_width=True,
                             column_config=build_col_config(
@@ -1293,6 +1381,19 @@ if "Pipeline" in _tab_idx:
                                 ints=["Open orders"],
                             ),
                         )
+
+                        if show_charts and not m2.empty:
+                            st.markdown(
+                                "**Billed vs pending per department**"
+                            )
+                            ch = m2[["Division", "Billed sales", "Pending"]].copy()
+                            st.bar_chart(
+                                ch, x="Division",
+                                y=["Billed sales", "Pending"], stack=True,
+                                color=[SERIES_COLORS["Billed sales"],
+                                       SERIES_COLORS["Pending"]],
+                                horizontal=True, height=340,
+                            )
 
                 # ---- By customer --------------------------------------------
                 with pipe_tabs[_p["By customer"]]:
@@ -1469,6 +1570,19 @@ if "Pipeline" in _tab_idx:
                         agg["% of pipeline"] = np.where(
                             pipe["pending_value"],
                             agg["Pending"] / pipe["pending_value"] * 100, 0)
+
+                        if show_charts and not agg.empty:
+                            ch_age = agg[["Bucket", "Pending"]].copy()
+                            ch_age["Bucket"] = ch_age["Bucket"].astype(str)
+                            ch_age["_color"] = ch_age["Bucket"].map(
+                                BUCKET_COLORS
+                            ).fillna(DEFAULT_DEPT_COLOR)
+                            st.markdown("**Pending pipeline by aging bucket**")
+                            st.bar_chart(
+                                ch_age, x="Bucket", y="Pending",
+                                color="_color", height=300,
+                            )
+
                         st.dataframe(
                             agg, hide_index=True, use_container_width=True,
                             column_config=build_col_config(
@@ -1514,6 +1628,21 @@ if "Pipeline" in _tab_idx:
                                  "Open orders": ("Sales Order", "nunique"),
                              }).reset_index()
                              .sort_values("Period"))
+                        if show_charts and not t.empty:
+                            st.markdown(
+                                "**Pending and delivered over time**"
+                            )
+                            try:
+                                st.bar_chart(
+                                    t, x="Period",
+                                    y=["Pending", "Delivered"], stack=True,
+                                    color=[SERIES_COLORS["Pending"],
+                                           SERIES_COLORS["Delivered"]],
+                                    height=300,
+                                )
+                            except Exception:
+                                pass
+
                         st.dataframe(
                             t, hide_index=True, use_container_width=True,
                             column_config=build_col_config(
@@ -1522,14 +1651,6 @@ if "Pipeline" in _tab_idx:
                                 ints=["Open orders"],
                             ),
                         )
-                        with st.expander("Optional: tiny chart"):
-                            try:
-                                chart_df = t.set_index("Period")[
-                                    ["Pending", "Delivered"]
-                                ]
-                                st.bar_chart(chart_df, height=260)
-                            except Exception:
-                                st.write("Chart unavailable.")
 
                 # ---- Raw orders ---------------------------------------------
                 with pipe_tabs[_p["Raw orders"]]:
@@ -1623,6 +1744,15 @@ with tabs[_tab_idx["Departments"]]:
         }])
         out = pd.concat([agg, total_row], ignore_index=True)
 
+        if show_charts and not agg.empty:
+            chart_df = agg[["Division", "Net sales", "Profit"]].copy()
+            chart_df["_color"] = chart_df["Division"].map(dept_color)
+            st.markdown("**Net sales by department**")
+            st.bar_chart(
+                chart_df, x="Division", y="Net sales",
+                color="_color", horizontal=True, height=320,
+            )
+
         st.dataframe(
             out, hide_index=True, use_container_width=True,
             column_config=build_col_config(
@@ -1632,6 +1762,26 @@ with tabs[_tab_idx["Departments"]]:
                 ints=["Units", "Invoices", "Customers", "Employees"],
             ),
         )
+
+        if show_charts and not agg.empty:
+            with st.expander("More charts: Profit and Margin %"):
+                c_left, c_right = st.columns(2)
+                with c_left:
+                    st.markdown("**Profit by department**")
+                    p_df = agg[["Division", "Profit"]].copy()
+                    p_df["_color"] = p_df["Division"].map(dept_color)
+                    st.bar_chart(
+                        p_df, x="Division", y="Profit",
+                        color="_color", horizontal=True, height=300,
+                    )
+                with c_right:
+                    st.markdown("**Margin % by department**")
+                    mg_df = agg[["Division", "Margin %"]].copy()
+                    mg_df["_color"] = mg_df["Division"].map(dept_color)
+                    st.bar_chart(
+                        mg_df, x="Division", y="Margin %",
+                        color="_color", horizontal=True, height=300,
+                    )
 
         st.write("")
         st.markdown("**Drill down: select a department to see its employees**")
@@ -2009,6 +2159,18 @@ with tabs[_tab_idx["Time trend"]]:
                                  t["Profit"] / t["Net sales"] * 100, 0)
         t = t.sort_values("Period")
 
+        if show_charts and not t.empty:
+            st.markdown("**Net sales and profit over time**")
+            try:
+                st.bar_chart(
+                    t, x="Period", y=["Net sales", "Profit"],
+                    color=[SERIES_COLORS["Net sales"],
+                           SERIES_COLORS["Profit"]],
+                    height=300,
+                )
+            except Exception:
+                pass
+
         st.dataframe(
             t, hide_index=True, use_container_width=True,
             column_config=build_col_config(
@@ -2018,13 +2180,6 @@ with tabs[_tab_idx["Time trend"]]:
                 ints=["Units", "Invoices"],
             ),
         )
-
-        with st.expander("Optional: tiny trend chart"):
-            try:
-                chart_df = t.set_index("Period")[["Net sales", "Profit"]]
-                st.bar_chart(chart_df, height=260)
-            except Exception:
-                st.write("Chart unavailable.")
 
 
 # ---------- Tab: Raw data --------------------------------------------------
